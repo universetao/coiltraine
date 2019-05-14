@@ -1,0 +1,546 @@
+diff --git a/.gitignore b/.gitignore
+index 6c51c6a..ea1dc21 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -102,3 +102,8 @@ ENV/
+ 
+ # pycharm
+ .idea
++
++datasetsSample/
++_logs*/
++_output_logs*/
++_preloads*/
+diff --git a/configs/coil_global.py b/configs/coil_global.py
+index 17286cf..f5b01d2 100644
+--- a/configs/coil_global.py
++++ b/configs/coil_global.py
+@@ -24,7 +24,7 @@ _g_conf.FINISH_ON_VALIDATION_STALE = None
+ 
+ 
+ """#### INPUT RELATED CONFIGURATION PARAMETERS ####"""
+-_g_conf.SENSORS = {'rgb': (3, 88, 200)}
++_g_conf.SENSORS = {'rgb': (2 , 88, 200)}
+ _g_conf.MEASUREMENTS = {'float_data': (31)}
+ _g_conf.TARGETS = ['steer', 'throttle', 'brake']
+ _g_conf.INPUTS = ['speed_module']
+diff --git a/configs/erfnet_pretrained.pth b/configs/erfnet_pretrained.pth
+new file mode 100644
+index 0000000..44fc485
+Binary files /dev/null and b/configs/erfnet_pretrained.pth differ
+diff --git a/configs/sample/coil_icra.yaml b/configs/sample/coil_icra.yaml
+index f09f9f7..e6ec264 100644
+--- a/configs/sample/coil_icra.yaml
++++ b/configs/sample/coil_icra.yaml
+@@ -7,7 +7,7 @@ MAGICAL_SEED: 26957017
+ # A dictionary with all the sensors that are going to be used as input
+ # this should match the train dataset
+ SENSORS:
+-  rgb: [3, 88, 200] # A RGB input sensor with three channels that is resized to 200x88
++  rgb: [2 , 88, 200] # A RGB input sensor with three channels that is resized to 200x88
+ MEASUREMENTS:
+   float_data: [31]  # Number of float data that must be read from the dataset
+ BATCH_SIZE: 120
+diff --git a/network/models/__init__.py b/network/models/__init__.py
+index d3d5539..34d5063 100644
+--- a/network/models/__init__.py
++++ b/network/models/__init__.py
+@@ -1 +1 @@
+-from  .coil_icra import CoILICRA
+\ No newline at end of file
++from  .segmentation_policy import CoILICRA
+\ No newline at end of file
+diff --git a/network/models/building_blocks/ErfNet_Fast.py b/network/models/building_blocks/ErfNet_Fast.py
+new file mode 100644
+index 0000000..2e9f013
+--- /dev/null
++++ b/network/models/building_blocks/ErfNet_Fast.py
+@@ -0,0 +1,151 @@
++# ERFNet full model definition for Pytorch
++# Sept 2017
++# Eduardo Romera
++#######################
++
++import torch
++import torch.nn as nn
++import torch.nn.init as init
++import torch.nn.functional as F
++
++class DownsamplerBlock (nn.Module):
++    def __init__(self, ninput, noutput):
++        super().__init__()
++
++        self.conv = nn.Conv2d(ninput, noutput-ninput, (3, 3), stride=2, padding=1, bias=True)
++        self.pool = nn.MaxPool2d(2, stride=2)
++        self.bn = nn.BatchNorm2d(noutput, eps=1e-3)
++
++    def forward(self, input):
++        output = torch.cat([self.conv(input), self.pool(input)], 1)
++        output = self.bn(output)
++        return F.relu(output)
++
++
++class non_bottleneck_1d (nn.Module):
++    def __init__(self, chann, dropprob, dilated):
++        super().__init__()
++
++        self.conv3x1_1 = nn.Conv2d(chann, chann, (3, 1), stride=1, padding=(1,0), bias=True)
++
++        self.conv1x3_1 = nn.Conv2d(chann, chann, (1,3), stride=1, padding=(0,1), bias=True)
++
++        self.bn1 = nn.BatchNorm2d(chann, eps=1e-03)
++
++        self.conv3x1_2 = nn.Conv2d(chann, chann, (3, 1), stride=1, padding=(1*dilated,0), bias=True, dilation = (dilated,1))
++
++        self.conv1x3_2 = nn.Conv2d(chann, chann, (1,3), stride=1, padding=(0,1*dilated), bias=True, dilation = (1, dilated))
++
++        self.bn2 = nn.BatchNorm2d(chann, eps=1e-03)
++
++        self.dropout = nn.Dropout2d(dropprob)
++
++
++    def forward(self, input):
++
++        output = self.conv3x1_1(input)
++        output = F.relu(output)
++        output = self.conv1x3_1(output)
++        output = self.bn1(output)
++        output = F.relu(output)
++
++        output = self.conv3x1_2(output)
++        output = F.relu(output)
++        output = self.conv1x3_2(output)
++        output = self.bn2(output)
++
++        if (self.dropout.p != 0):
++            output = self.dropout(output)
++
++        return F.relu(output+input)    #+input = identity (residual connection)
++
++
++class Encoder(nn.Module):
++    def __init__(self, num_classes):
++        super().__init__()
++        self.initial_block = DownsamplerBlock(3,16)
++
++        self.layers = nn.ModuleList()
++
++        # self.layers.append(DownsamplerBlock(16,64))
++
++        for x in range(0, 5):    #5 times
++           self.layers.append(non_bottleneck_1d(16, 0.03, 1))
++
++        self.layers.append(DownsamplerBlock(16,64))
++
++        #for x in range(0, 2):    #1 times
++        self.layers.append(non_bottleneck_1d(64, 0.3, 2))
++        self.layers.append(non_bottleneck_1d(64, 0.3, 4))
++        self.layers.append(non_bottleneck_1d(64, 0.3, 8))
++        self.layers.append(non_bottleneck_1d(64, 0.3, 16))
++
++        #Only in encoder mode:
++        self.output_conv = nn.Conv2d(64, num_classes, 1, stride=1, padding=0, bias=True)
++
++    def forward(self, input, predict=False):
++        output = self.initial_block(input)
++
++        for layer in self.layers:
++            output = layer(output)
++
++        if predict:
++            output = self.output_conv(output)
++
++        return output
++
++
++class UpsamplerBlock (nn.Module):
++    def __init__(self, ninput, noutput):
++        super().__init__()
++        self.conv = nn.ConvTranspose2d(ninput, noutput, 3, stride=2, padding=1, output_padding=1, bias=True)
++        self.bn = nn.BatchNorm2d(noutput, eps=1e-3)
++
++    def forward(self, input):
++        output = self.conv(input)
++        output = self.bn(output)
++        return F.relu(output)
++
++class Decoder (nn.Module):
++    def __init__(self, num_classes):
++        super().__init__()
++
++        self.layers = nn.ModuleList()
++
++        # self.layers.append(UpsamplerBlock(128,64))
++        # self.layers.append(non_bottleneck_1d(64, 0, 1))
++        # self.layers.append(non_bottleneck_1d(64, 0, 1))
++
++        self.layers.append(UpsamplerBlock(64,16))
++        self.layers.append(non_bottleneck_1d(16, 0, 1))
++        self.layers.append(non_bottleneck_1d(16, 0, 1))
++
++        self.output_conv = nn.ConvTranspose2d( 16, num_classes, 2, stride=2, padding=0, output_padding=0, bias=True)
++
++    def forward(self, input):
++        output = input
++
++        for layer in self.layers:
++            output = layer(output)
++
++        output = self.output_conv(output)
++
++        return output
++
++#ERFNet
++class Net(nn.Module):
++    def __init__(self, num_classes, encoder=None):  #use encoder to pass pretrained encoder
++        super().__init__()
++
++        if (encoder == None):
++            self.encoder = Encoder(num_classes)
++        else:
++            self.encoder = encoder
++        self.decoder = Decoder(num_classes)
++
++    def forward(self, input, only_encode=False):
++        if only_encode:
++            return self.encoder.forward(input, predict=True)
++        else:
++            output = self.encoder(input)    #predict=False by default
++            return self.decoder.forward(output)
+diff --git a/network/models/building_blocks/__init__.py b/network/models/building_blocks/__init__.py
+index 78bb2ca..97bf57b 100644
+--- a/network/models/building_blocks/__init__.py
++++ b/network/models/building_blocks/__init__.py
+@@ -2,3 +2,4 @@ from .branching import Branching
+ from .conv import Conv
+ from .fc import FC
+ from .join import Join
++from .ErfNet_Fast import Net
+diff --git a/network/models/building_blocks/erfnet.py b/network/models/building_blocks/erfnet.py
+new file mode 100644
+index 0000000..15d6832
+--- /dev/null
++++ b/network/models/building_blocks/erfnet.py
+@@ -0,0 +1,151 @@
++# ERFNet full model definition for Pytorch
++# Sept 2017
++# Eduardo Romera
++#######################
++
++import torch
++import torch.nn as nn
++import torch.nn.init as init
++import torch.nn.functional as F
++
++class DownsamplerBlock (nn.Module):
++    def __init__(self, ninput, noutput):
++        super().__init__()
++
++        self.conv = nn.Conv2d(ninput, noutput-ninput, (3, 3), stride=2, padding=1, bias=True)
++        self.pool = nn.MaxPool2d(2, stride=2)
++        self.bn = nn.BatchNorm2d(noutput, eps=1e-3)
++
++    def forward(self, input):
++        output = torch.cat([self.conv(input), self.pool(input)], 1)
++        output = self.bn(output)
++        return F.relu(output)
++    
++
++class non_bottleneck_1d (nn.Module):
++    def __init__(self, chann, dropprob, dilated):        
++        super().__init__()
++
++        self.conv3x1_1 = nn.Conv2d(chann, chann, (3, 1), stride=1, padding=(1,0), bias=True)
++
++        self.conv1x3_1 = nn.Conv2d(chann, chann, (1,3), stride=1, padding=(0,1), bias=True)
++
++        self.bn1 = nn.BatchNorm2d(chann, eps=1e-03)
++
++        self.conv3x1_2 = nn.Conv2d(chann, chann, (3, 1), stride=1, padding=(1*dilated,0), bias=True, dilation = (dilated,1))
++
++        self.conv1x3_2 = nn.Conv2d(chann, chann, (1,3), stride=1, padding=(0,1*dilated), bias=True, dilation = (1, dilated))
++
++        self.bn2 = nn.BatchNorm2d(chann, eps=1e-03)
++
++        self.dropout = nn.Dropout2d(dropprob)
++        
++
++    def forward(self, input):
++
++        output = self.conv3x1_1(input)
++        output = F.relu(output)
++        output = self.conv1x3_1(output)
++        output = self.bn1(output)
++        output = F.relu(output)
++
++        output = self.conv3x1_2(output)
++        output = F.relu(output)
++        output = self.conv1x3_2(output)
++        output = self.bn2(output)
++
++        if (self.dropout.p != 0):
++            output = self.dropout(output)
++        
++        return F.relu(output+input)    #+input = identity (residual connection)
++
++
++class Encoder(nn.Module):
++    def __init__(self, num_classes):
++        super().__init__()
++        self.initial_block = DownsamplerBlock(3,16)
++
++        self.layers = nn.ModuleList()
++
++        self.layers.append(DownsamplerBlock(16,64))
++
++        for x in range(0, 5):    #5 times
++           self.layers.append(non_bottleneck_1d(64, 0.03, 1)) 
++
++        self.layers.append(DownsamplerBlock(64,128))
++
++        for x in range(0, 2):    #2 times
++            self.layers.append(non_bottleneck_1d(128, 0.3, 2))
++            self.layers.append(non_bottleneck_1d(128, 0.3, 4))
++            self.layers.append(non_bottleneck_1d(128, 0.3, 8))
++            self.layers.append(non_bottleneck_1d(128, 0.3, 16))
++
++        #Only in encoder mode:
++        self.output_conv = nn.Conv2d(128, num_classes, 1, stride=1, padding=0, bias=True)
++
++    def forward(self, input, predict=False):
++        output = self.initial_block(input)
++
++        for layer in self.layers:
++            output = layer(output)
++
++        if predict:
++            output = self.output_conv(output)
++
++        return output
++
++
++class UpsamplerBlock (nn.Module):
++    def __init__(self, ninput, noutput):
++        super().__init__()
++        self.conv = nn.ConvTranspose2d(ninput, noutput, 3, stride=2, padding=1, output_padding=1, bias=True)
++        self.bn = nn.BatchNorm2d(noutput, eps=1e-3)
++
++    def forward(self, input):
++        output = self.conv(input)
++        output = self.bn(output)
++        return F.relu(output)
++
++class Decoder (nn.Module):
++    def __init__(self, num_classes):
++        super().__init__()
++
++        self.layers = nn.ModuleList()
++
++        self.layers.append(UpsamplerBlock(128,64))
++        self.layers.append(non_bottleneck_1d(64, 0, 1))
++        self.layers.append(non_bottleneck_1d(64, 0, 1))
++
++        self.layers.append(UpsamplerBlock(64,16))
++        self.layers.append(non_bottleneck_1d(16, 0, 1))
++        self.layers.append(non_bottleneck_1d(16, 0, 1))
++
++        self.output_conv = nn.ConvTranspose2d( 16, num_classes, 2, stride=2, padding=0, output_padding=0, bias=True)
++
++    def forward(self, input):
++        output = input
++
++        for layer in self.layers:
++            output = layer(output)
++
++        output = self.output_conv(output)
++
++        return output
++
++#ERFNet
++class Net(nn.Module):
++    def __init__(self, num_classes, encoder=None):  #use encoder to pass pretrained encoder
++        super().__init__()
++
++        if (encoder == None):
++            self.encoder = Encoder(num_classes)
++        else:
++            self.encoder = encoder
++        self.decoder = Decoder(num_classes)
++
++    def forward(self, input, only_encode=False):
++        if only_encode:
++            return self.encoder.forward(input, predict=True)
++        else:
++            output = self.encoder(input)    #predict=False by default
++            return self.decoder.forward(output)
+diff --git a/network/models/segmentation_policy.py b/network/models/segmentation_policy.py
+new file mode 100644
+index 0000000..6b0ba01
+--- /dev/null
++++ b/network/models/segmentation_policy.py
+@@ -0,0 +1,165 @@
++from logger import coil_logger
++import torch.nn as nn
++import torch
++import importlib
++
++from configs import g_conf
++from coilutils.general import command_number_to_index
++
++from .building_blocks import Conv
++from .building_blocks import Branching
++from .building_blocks import FC
++from .building_blocks import Join
++from .building_blocks import Net
++
++class CoILICRA(nn.Module):
++
++    def __init__(self, params):
++        # TODO: Improve the model autonaming function
++
++        super(CoILICRA, self).__init__()
++        self.params = params
++
++        number_first_layer_channels = 0
++        
++        #erf_module.load_state_dict(torch.load("/home/dyt/coiltraine/configs/erfnet_pretrained.pth"))
++        for _, sizes in g_conf.SENSORS.items():
++            number_first_layer_channels += sizes[0] * g_conf.NUMBER_FRAMES_FUSION
++
++        # Get one item from the dict
++        sensor_input_shape = next(iter(g_conf.SENSORS.values()))
++        sensor_input_shape = [number_first_layer_channels, sensor_input_shape[1],
++                              sensor_input_shape[2]]
++
++        # For this case we check if the perception layer is of the type "conv"
++        if 'conv' in params['perception']:
++            perception_convs = Conv(params={'channels': [number_first_layer_channels] +
++                                                          params['perception']['conv']['channels'],
++                                            'kernels': params['perception']['conv']['kernels'],
++                                            'strides': params['perception']['conv']['strides'],
++                                            'dropouts': params['perception']['conv']['dropouts'],
++                                            'end_layer': True})
++
++            perception_fc = FC(params={'neurons': [perception_convs.get_conv_output(sensor_input_shape)]
++                                                  + params['perception']['fc']['neurons'],
++                                       'dropouts': params['perception']['fc']['dropouts'],
++                                       'end_layer': False})
++            self.erf_module=Net(2)
++            self.perception = nn.Sequential(*[perception_convs, perception_fc])
++
++            number_output_neurons = params['perception']['fc']['neurons'][-1]
++
++        elif 'res' in params['perception']:  # pre defined residual networks
++            resnet_module = importlib.import_module('network.models.building_blocks.resnet')
++            resnet_module = getattr(resnet_module, params['perception']['res']['name'])
++            self.perception = resnet_module(pretrained=g_conf.PRE_TRAINED,
++                                             num_classes=params['perception']['res']['num_classes'])
++
++            number_output_neurons = params['perception']['res']['num_classes']
++
++        else:
++
++            raise ValueError("invalid convolution layer type")
++
++        self.measurements = FC(params={'neurons': [len(g_conf.INPUTS)] +
++                                                   params['measurements']['fc']['neurons'],
++                                       'dropouts': params['measurements']['fc']['dropouts'],
++                                       'end_layer': False})
++
++        self.join = Join(
++            params={'after_process':
++                         FC(params={'neurons':
++                                        [params['measurements']['fc']['neurons'][-1] +
++                                         number_output_neurons] +
++                                        params['join']['fc']['neurons'],
++                                     'dropouts': params['join']['fc']['dropouts'],
++                                     'end_layer': False}),
++                     'mode': 'cat'
++                    }
++         )
++
++        self.speed_branch = FC(params={'neurons': [params['join']['fc']['neurons'][-1]] +
++                                                  params['speed_branch']['fc']['neurons'] + [1],
++                                       'dropouts': params['speed_branch']['fc']['dropouts'] + [0.0],
++                                       'end_layer': True})
++
++        # Create the fc vector separatedely
++        branch_fc_vector = []
++        for i in range(params['branches']['number_of_branches']):
++            branch_fc_vector.append(FC(params={'neurons': [params['join']['fc']['neurons'][-1]] +
++                                                         params['branches']['fc']['neurons'] +
++                                                         [len(g_conf.TARGETS)],
++                                               'dropouts': params['branches']['fc']['dropouts'] + [0.0],
++                                               'end_layer': True}))
++
++        self.branches = Branching(branch_fc_vector)  # Here we set branching automatically
++
++        if 'conv' in params['perception']:
++            for m in self.modules():
++                if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
++                    nn.init.xavier_uniform_(m.weight)
++                    nn.init.constant_(m.bias, 0.1)
++        else:
++            for m in self.modules():
++                if isinstance(m, nn.Linear):
++                    nn.init.xavier_uniform_(m.weight)
++                    nn.init.constant_(m.bias, 0.1)
++
++
++    def forward(self, x, a):
++        """ ###### APPLY THE PERCEPTION MODULE """
++        x=self.erf_module(x)
++        #print(x)
++        x, inter = self.perception(x)
++        ## Not a variable, just to store intermediate layers for future vizualization
++        #self.intermediate_layers = inter
++
++        """ ###### APPLY THE MEASUREMENT MODULE """
++        #m = self.measurements(a)
++        """ Join measurements and perception"""
++        #j = self.join(x, m)
++
++        branch_outputs = self.branches(x)
++
++        speed_branch_output = self.speed_branch(x)
++
++        # We concatenate speed with the rest.
++        return branch_outputs + [speed_branch_output]
++
++    def forward_branch(self, x, a, branch_number):
++        """
++        DO a forward operation and return a single branch.
++
++        Args:
++            x: the image input
++            a: speed measurement
++            branch_number: the branch number to be returned
++
++        Returns:
++            the forward operation on the selected branch
++
++        """
++        # Convert to integer just in case .
++        # TODO: take four branches, this is hardcoded
++        output_vec = torch.stack(self.forward(x, a)[0:4])
++
++        return self.extract_branch(output_vec, branch_number)
++
++    def get_perception_layers(self, x):
++        return self.perception.get_layers_features(x)
++
++    def extract_branch(self, output_vec, branch_number):
++
++        branch_number = command_number_to_index(branch_number)
++
++        if len(branch_number) > 1:
++            branch_number = torch.squeeze(branch_number.type(torch.cuda.LongTensor))
++        else:
++            branch_number = branch_number.type(torch.cuda.LongTensor)
++
++        branch_number = torch.stack([branch_number,
++                                     torch.cuda.LongTensor(range(0, len(branch_number)))])
++
++        return output_vec[branch_number[0], branch_number[1], :]
++
++
