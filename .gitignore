@@ -102,3 +102,8 @@ ENV/
 
 # pycharm
 .idea
+
+datasetsSample/
+_logs*/
+_output_logs*/
+_preloads*/
