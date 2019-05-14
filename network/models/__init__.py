@@ -1,1 +1,1 @@
-from  .coil_icra import CoILICRA
+from  .segmentation_policy import CoILICRA

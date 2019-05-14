@@ -24,7 +24,7 @@ _g_conf.FINISH_ON_VALIDATION_STALE = None
 
 
 """#### INPUT RELATED CONFIGURATION PARAMETERS ####"""
-_g_conf.SENSORS = {'rgb': (3, 88, 200)}
+_g_conf.SENSORS = {'rgb': (2 , 88, 200)}
 _g_conf.MEASUREMENTS = {'float_data': (31)}
 _g_conf.TARGETS = ['steer', 'throttle', 'brake']
 _g_conf.INPUTS = ['speed_module']
